@@ -182,6 +182,10 @@ extern "C" {
 #define EC_FEISHU_PING_INTERVAL_S   120
 #endif
 
+#ifndef EC_HEALTH_LOG_INTERVAL_MS
+#define EC_HEALTH_LOG_INTERVAL_MS   (60 * 1000)
+#endif
+
 /* ==================== [Typedefs] ========================================== */
 
 /* ==================== [Global Prototypes] ================================= */

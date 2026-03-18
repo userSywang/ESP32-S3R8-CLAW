@@ -56,6 +56,7 @@ typedef struct {
 
 static esp_err_t ec_cron_service_start(void);
 static esp_err_t cron_save_jobs(void);
+static esp_err_t cron_load_jobs(void);
 
 static esp_err_t ec_tool_cron_add_execute(const char *input_json, char *output, size_t output_size);
 static esp_err_t ec_tool_cron_list_execute(const char *input_json, char *output, size_t output_size);
@@ -70,6 +71,7 @@ static int s_job_count = 0;
 static bool s_cron_service_started = false;
 static bool s_skip_task_start_for_test = false;
 static bool s_skip_persist_for_test = false;
+static bool s_jobs_loaded = false;
 
 static const ec_tools_t s_cron_add = {
     .name = "cron_add",
@@ -208,6 +210,28 @@ static ec_cron_job_t *cron_find_matching_job(const ec_cron_job_t *candidate)
     return NULL;
 }
 
+static char *cron_build_dispatch_message(const ec_cron_job_t *job)
+{
+    static const char *prefix =
+        "Scheduled reminder: execute the following instruction now and reply directly. "
+        "Do not mention scheduling, setup, or confirmation.\n\nInstruction: ";
+    size_t len = 0;
+    char *msg = NULL;
+
+    if (!job || !job->message[0]) {
+        return NULL;
+    }
+
+    len = strlen(prefix) + strlen(job->message) + 1;
+    msg = (char *)malloc(len);
+    if (!msg) {
+        return NULL;
+    }
+
+    snprintf(msg, len, "%s%s", prefix, job->message);
+    return msg;
+}
+
 static bool cron_sanitize_destination(ec_cron_job_t *job)
 {
     bool changed = false;
@@ -308,6 +332,147 @@ static esp_err_t cron_save_jobs(void)
     return ESP_OK;
 }
 
+static esp_err_t cron_load_jobs(void)
+{
+    FILE *f = NULL;
+    long len = 0;
+    char *json = NULL;
+    cJSON *root = NULL;
+    cJSON *jobs_arr = NULL;
+    int loaded = 0;
+    time_t now = time(NULL);
+
+    if (s_jobs_loaded) {
+        return ESP_OK;
+    }
+
+    f = fopen(EC_CRON_FILE, "r");
+    if (!f) {
+        s_jobs_loaded = true;
+        ESP_LOGI(TAG, "No cron file found at %s", EC_CRON_FILE);
+        return ESP_OK;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    len = ftell(f);
+    if (len <= 0) {
+        fclose(f);
+        s_jobs_loaded = true;
+        return ESP_OK;
+    }
+    rewind(f);
+
+    json = (char *)calloc(1, (size_t)len + 1);
+    if (!json) {
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (fread(json, 1, (size_t)len, f) != (size_t)len) {
+        fclose(f);
+        free(json);
+        return ESP_FAIL;
+    }
+    fclose(f);
+
+    root = cJSON_Parse(json);
+    free(json);
+    if (!root) {
+        ESP_LOGW(TAG, "Failed to parse %s", EC_CRON_FILE);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    jobs_arr = cJSON_GetObjectItem(root, "jobs");
+    if (!cJSON_IsArray(jobs_arr)) {
+        cJSON_Delete(root);
+        s_jobs_loaded = true;
+        return ESP_OK;
+    }
+
+    memset(s_jobs, 0, sizeof(s_jobs));
+    s_job_count = 0;
+
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, jobs_arr) {
+        ec_cron_job_t job = {0};
+        cJSON *kind = cJSON_GetObjectItem(item, "kind");
+        cJSON *name = cJSON_GetObjectItem(item, "name");
+        cJSON *message = cJSON_GetObjectItem(item, "message");
+        cJSON *enabled = cJSON_GetObjectItem(item, "enabled");
+        cJSON *delete_after_run = cJSON_GetObjectItem(item, "delete_after_run");
+        cJSON *interval_s = cJSON_GetObjectItem(item, "interval_s");
+        cJSON *at_epoch = cJSON_GetObjectItem(item, "at_epoch");
+        cJSON *last_run = cJSON_GetObjectItem(item, "last_run");
+        cJSON *next_run = cJSON_GetObjectItem(item, "next_run");
+        cJSON *channel = cJSON_GetObjectItem(item, "channel");
+        cJSON *chat_id = cJSON_GetObjectItem(item, "chat_id");
+        cJSON *id = cJSON_GetObjectItem(item, "id");
+
+        if (s_job_count >= EC_MAX_CRON_JOBS) {
+            break;
+        }
+        if (!cJSON_IsString(kind) || !cJSON_IsString(name) || !cJSON_IsString(message)) {
+            continue;
+        }
+
+        if (strcmp(kind->valuestring, "every") == 0) {
+            if (!cJSON_IsNumber(interval_s) || interval_s->valuedouble <= 0) {
+                continue;
+            }
+            job.kind = CRON_KIND_EVERY;
+            job.interval_s = (uint32_t)interval_s->valuedouble;
+        } else if (strcmp(kind->valuestring, "at") == 0) {
+            if (!cJSON_IsNumber(at_epoch)) {
+                continue;
+            }
+            job.kind = CRON_KIND_AT;
+            job.at_epoch = (int64_t)at_epoch->valuedouble;
+        } else {
+            continue;
+        }
+
+        if (cJSON_IsString(id)) {
+            strncpy(job.id, id->valuestring, sizeof(job.id) - 1);
+        }
+        strncpy(job.name, name->valuestring, sizeof(job.name) - 1);
+        strncpy(job.message, message->valuestring, sizeof(job.message) - 1);
+        if (cJSON_IsString(channel)) {
+            strncpy(job.channel, channel->valuestring, sizeof(job.channel) - 1);
+        }
+        if (cJSON_IsString(chat_id)) {
+            strncpy(job.chat_id, chat_id->valuestring, sizeof(job.chat_id) - 1);
+        }
+        job.enabled = cJSON_IsBool(enabled) ? cJSON_IsTrue(enabled) : true;
+        job.delete_after_run = cJSON_IsBool(delete_after_run) ? cJSON_IsTrue(delete_after_run) : (job.kind == CRON_KIND_AT);
+        job.last_run = cJSON_IsNumber(last_run) ? (int64_t)last_run->valuedouble : 0;
+        job.next_run = cJSON_IsNumber(next_run) ? (int64_t)next_run->valuedouble : 0;
+
+        cron_sanitize_destination(&job);
+
+        if (job.kind == CRON_KIND_AT && job.at_epoch <= now) {
+            if (job.delete_after_run) {
+                ESP_LOGI(TAG, "Skip expired one-shot cron job during restore: %s (%s)", job.name, job.id);
+                continue;
+            }
+            job.enabled = false;
+            job.next_run = 0;
+        } else if (job.enabled && job.next_run <= 0) {
+            compute_initial_next_run(&job);
+        }
+
+        s_jobs[s_job_count++] = job;
+        loaded++;
+    }
+
+    cJSON_Delete(root);
+    s_jobs_loaded = true;
+    ESP_LOGI(TAG, "Loaded %d cron jobs from %s", loaded, EC_CRON_FILE);
+    return ESP_OK;
+}
+
 static void cron_process_due_jobs(void)
 {
     time_t now = time(NULL);
@@ -335,7 +500,7 @@ static void cron_process_due_jobs(void)
         strncpy(msg.channel, job->channel, sizeof(msg.channel) - 1);
         strncpy(msg.chat_id, job->chat_id, sizeof(msg.chat_id) - 1);
         ESP_LOGI(TAG, "Cron dispatch -> %s:%s msg=%s", job->channel, job->chat_id, job->message);
-        msg.content = strdup(job->message);
+        msg.content = cron_build_dispatch_message(job);
 
         if (msg.content) {
             esp_err_t err = ec_agent_inbound(&msg);
@@ -343,6 +508,8 @@ static void cron_process_due_jobs(void)
                 ESP_LOGW(TAG, "Failed to push cron message: %s", esp_err_to_name(err));
                 free(msg.content);
             }
+        } else {
+            ESP_LOGW(TAG, "Failed to build cron dispatch message");
         }
 
         /* Update state */
@@ -395,6 +562,8 @@ static esp_err_t ec_cron_service_start(void)
     if (s_cron_service_started) {
         return ESP_OK;
     }
+
+    cron_load_jobs();
 
     /* Recompute next_run for all enabled jobs that don't have one */
     time_t now = time(NULL);
@@ -665,6 +834,7 @@ void ec_tools_cron_reset_for_test(void)
     memset(s_jobs, 0, sizeof(s_jobs));
     s_job_count = 0;
     s_cron_service_started = false;
+    s_jobs_loaded = false;
     s_skip_task_start_for_test = false;
     s_skip_persist_for_test = false;
 }

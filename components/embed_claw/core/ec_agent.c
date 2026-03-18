@@ -33,6 +33,7 @@
 
 #define EC_TOOL_OUTPUT_SIZE  (4 * 1024)
 #define EC_AGENT_PROMPT_SCRATCH_SIZE 4096
+#define EC_CRON_ADD_CACHE_SIZE 1024
 
 #define AGENT_SYSTEM_PROMPT_STR \
         "You are EmbedClaw, a helpful and concise AI assistant running on an ESP32 device.\n"\
@@ -49,7 +50,8 @@
         "- cron_list: list tasks.\n"\
         "- cron_remove: remove task.\n\n"\
         "When using cron_add for feishu delivery, always set channel='feishu' and a valid chat_id like open_id:... or chat_id:....\n\n"\
-        "For cron reminders, set cron_add.message to the exact future instruction to execute when the job fires. Preserve the user's intent, avoid confirmation wording, and do not ask follow-up questions inside the scheduled message.\n\n"\
+        "For cron reminders, set cron_add.message to the exact future instruction to execute when the job fires. Preserve the user's intent, avoid confirmation wording, and do not ask follow-up questions inside the scheduled message.\n"\
+        "If cron_add returns OK for a reminder in the current turn, do not call cron_add again for the same reminder.\n\n"\
         "Use tools when needed. Provide your final answer as text after using tools.\n\n"\
         "## Memory\n"\
         "You have persistent memory stored on local flash:\n"\
@@ -72,6 +74,12 @@
 /* ==================== [Static Prototypes] ================================= */
 
 static void agent_loop_task(void *arg);
+
+typedef struct {
+    bool has_last_cron_add;
+    char last_cron_add_input[EC_CRON_ADD_CACHE_SIZE];
+    char last_cron_add_result[EC_CRON_ADD_CACHE_SIZE];
+} agent_turn_state_t;
 
 /* ==================== [Static Variables] ================================== */
 
@@ -217,7 +225,8 @@ static char *patch_tool_input_with_context(const ec_llm_tool_call_t *call, const
 }
 
 static cJSON *build_tool_results(const ec_llm_response_t *resp, const ec_msg_t *msg,
-                                 char *tool_output, size_t tool_output_size)
+                                 char *tool_output, size_t tool_output_size,
+                                 agent_turn_state_t *turn_state)
 {
     cJSON *content = cJSON_CreateArray();
 
@@ -225,13 +234,34 @@ static cJSON *build_tool_results(const ec_llm_response_t *resp, const ec_msg_t *
         const ec_llm_tool_call_t *call = &resp->calls[i];
         const char *tool_input = call->input ? call->input : "{}";
         char *patched_input = patch_tool_input_with_context(call, msg);
+        esp_err_t tool_err = ESP_OK;
         if (patched_input) {
             tool_input = patched_input;
         }
 
-        /* Execute tool */
         tool_output[0] = '\0';
-        ec_tools_execute(call->name, tool_input, tool_output, tool_output_size);
+
+        if (turn_state && strcmp(call->name, "cron_add") == 0 &&
+                turn_state->has_last_cron_add &&
+                strcmp(turn_state->last_cron_add_input, tool_input) == 0) {
+            snprintf(tool_output, tool_output_size, "%s",
+                     turn_state->last_cron_add_result[0] ?
+                     turn_state->last_cron_add_result :
+                     "OK: cron_add already executed for this reminder in the current turn.");
+            ESP_LOGI(TAG, "Skip duplicate cron_add in same turn");
+        } else {
+            tool_err = ec_tools_execute(call->name, tool_input, tool_output, tool_output_size);
+            if (turn_state && strcmp(call->name, "cron_add") == 0 && tool_err == ESP_OK) {
+                snprintf(turn_state->last_cron_add_input,
+                         sizeof(turn_state->last_cron_add_input),
+                         "%s", tool_input);
+                snprintf(turn_state->last_cron_add_result,
+                         sizeof(turn_state->last_cron_add_result),
+                         "%s", tool_output);
+                turn_state->has_last_cron_add = true;
+            }
+        }
+
         free(patched_input);
 
         ESP_LOGI(TAG, "Tool %s result: %d bytes", call->name, (int)strlen(tool_output));
@@ -413,6 +443,7 @@ static void agent_loop_task(void *arg)
         cJSON_AddStringToObject(user_msg, "role", "user");
         cJSON_AddStringToObject(user_msg, "content", msg.content);
         cJSON_AddItemToArray(messages, user_msg);
+        agent_turn_state_t turn_state = {0};
 
         // 进入 ReAct 循环，最多迭代 EC_AGENT_MAX_TOOL_ITER 次
         for (size_t i = 0; i < EC_AGENT_MAX_TOOL_ITER; i++) {
@@ -457,7 +488,7 @@ static void agent_loop_task(void *arg)
             cJSON_AddItemToArray(messages, asst_msg);
 
             // 执行工具并将结果追加到消息数组中，供下一轮 LLM 调用使用
-            cJSON *tool_results = build_tool_results(&resp, &msg, tool_output, EC_TOOL_OUTPUT_SIZE);
+            cJSON *tool_results = build_tool_results(&resp, &msg, tool_output, EC_TOOL_OUTPUT_SIZE, &turn_state);
             cJSON *result_msg = cJSON_CreateObject();
             cJSON_AddStringToObject(result_msg, "role", "user");
             cJSON_AddItemToObject(result_msg, "content", tool_results);

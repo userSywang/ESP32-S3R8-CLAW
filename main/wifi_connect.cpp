@@ -24,6 +24,7 @@
 #include "embedclaw_config.h"
 
 static const char *TAG = "wifi_connect";
+static bool s_embed_claw_started = false;
 
 static void wifi_event_handler(WifiEvent event, const std::string &data)
 {
@@ -36,7 +37,18 @@ static void wifi_event_handler(WifiEvent event, const std::string &data)
             break;
         case WifiEvent::Connected:
             ESP_LOGI(TAG, "Connected successfully!");
-            ESP_ERROR_CHECK(ec_embed_claw_start());
+            if (s_embed_claw_started) {
+                ESP_LOGI(TAG, "EmbedClaw services already running, skip duplicate start");
+                break;
+            }
+            {
+                esp_err_t err = ec_embed_claw_start();
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "EmbedClaw start failed after Wi-Fi connect: %s", esp_err_to_name(err));
+                    break;
+                }
+                s_embed_claw_started = true;
+            }
             break;
         case WifiEvent::Disconnected:
             ESP_LOGW(TAG, "Disconnected from network, reason: %s", data.c_str());

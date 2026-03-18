@@ -12,6 +12,7 @@
 /* ==================== [Includes] ========================================== */
 
 #include "ec_config_internal.h"
+#include "channel/ec_channel_feishu.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -118,6 +119,14 @@ static QueueHandle_t s_ws_event_queue = NULL;
 static int64_t s_ws_connected_at_us = 0;
 static char s_last_event_ids[FEISHU_LAST_EVENT_ID_N][96] = {0};
 static int s_last_event_id_idx = 0;
+static bool s_ws_connected = false;
+static uint32_t s_ws_connect_count = 0;
+static uint32_t s_ws_disconnect_count = 0;
+static int64_t s_last_event_at_us = 0;
+static int64_t s_last_send_ok_at_us = 0;
+static TaskHandle_t s_feishu_evt_task = NULL;
+static TaskHandle_t s_feishu_tok_task = NULL;
+static TaskHandle_t s_feishu_ws_task = NULL;
 
 static const ec_channel_t s_driver = {
     .name = EC_CHAN_FEISHU,
@@ -147,6 +156,31 @@ esp_err_t ec_channel_feishu(void)
     ec_channel_register(&s_driver);
 
     return ESP_OK;
+}
+
+void ec_channel_feishu_get_health(bool *connected,
+                                  uint32_t *connect_count,
+                                  uint32_t *disconnect_count,
+                                  int64_t *last_event_age_ms,
+                                  int64_t *last_send_age_ms)
+{
+    int64_t now_us = esp_timer_get_time();
+
+    if (connected) {
+        *connected = s_ws_connected;
+    }
+    if (connect_count) {
+        *connect_count = s_ws_connect_count;
+    }
+    if (disconnect_count) {
+        *disconnect_count = s_ws_disconnect_count;
+    }
+    if (last_event_age_ms) {
+        *last_event_age_ms = s_last_event_at_us > 0 ? (now_us - s_last_event_at_us) / 1000 : -1;
+    }
+    if (last_send_age_ms) {
+        *last_send_age_ms = s_last_send_ok_at_us > 0 ? (now_us - s_last_send_ok_at_us) / 1000 : -1;
+    }
 }
 
 /* ==================== [Static Functions] ================================== */
@@ -704,6 +738,7 @@ static void process_ws_event_payload(const char *payload, size_t payload_len)
     if (!cJSON_IsString(ev_type) || strcmp(ev_type->valuestring, "im.message.receive_v1") != 0) {
         goto ws_data_done;
     }
+    s_last_event_at_us = esp_timer_get_time();
 
     /* Log full payload in async task to avoid blocking websocket callback */
     ESP_LOGI(TAG, "Feishu WS: full payload (%u bytes):", (unsigned)payload_len);
@@ -838,12 +873,16 @@ static void handle_ws_event(void *arg, esp_event_base_t base, int32_t event_id, 
     case WEBSOCKET_EVENT_CONNECTED: {
         int64_t now_us = esp_timer_get_time();
         ESP_LOGI(TAG, "Feishu WS connected");
+        s_ws_connected = true;
+        s_ws_connect_count++;
         s_last_ping_us = now_us;
         s_ws_connected_at_us = now_us;
         break;
     }
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "Feishu WS disconnected");
+        s_ws_connected = false;
+        s_ws_disconnect_count++;
         break;
     case WEBSOCKET_EVENT_DATA: {
         if (!data || !data->data_len || data->op_code != 0x02) {
@@ -971,6 +1010,7 @@ static void feishu_ws_task(void *arg)
         esp_websocket_client_stop(s_ws_client);
         esp_websocket_client_destroy(s_ws_client);
         s_ws_client = NULL;
+        s_ws_connected = false;
         vTaskDelay(pdMS_TO_TICKS(FEISHU_WS_RECONNECT_MS));
     }
 }
@@ -1009,6 +1049,11 @@ static void token_refresh_task(void *arg)
 
 static esp_err_t ec_channel_feishu_start(void)
 {
+    if (s_feishu_evt_task && s_feishu_tok_task && s_feishu_ws_task) {
+        ESP_LOGI(TAG, "Feishu long connection already running");
+        return ESP_OK;
+    }
+
     if (!s_ws_event_queue) {
         s_ws_event_queue = xQueueCreate(FEISHU_EVENT_QUEUE_LEN, sizeof(feishu_event_job_t));
     }
@@ -1017,25 +1062,34 @@ static esp_err_t ec_channel_feishu_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    BaseType_t evt_ok = xTaskCreatePinnedToCore(feishu_event_worker_task, "feishu_evt",
+    BaseType_t evt_ok = pdPASS;
+    if (!s_feishu_evt_task) {
+        evt_ok = xTaskCreatePinnedToCore(feishu_event_worker_task, "feishu_evt",
                         FEISHU_TASK_STACK, NULL,
-                        FEISHU_TASK_PRIO, NULL, FEISHU_TASK_CORE);
+                        FEISHU_TASK_PRIO, &s_feishu_evt_task, FEISHU_TASK_CORE);
+    }
     if (evt_ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create Feishu event worker task");
         return ESP_FAIL;
     }
 
-    BaseType_t tok_ok = xTaskCreatePinnedToCore(token_refresh_task, "feishu_tok",
+    BaseType_t tok_ok = pdPASS;
+    if (!s_feishu_tok_task) {
+        tok_ok = xTaskCreatePinnedToCore(token_refresh_task, "feishu_tok",
                         FEISHU_TASK_STACK, NULL,
-                        FEISHU_TASK_PRIO, NULL, FEISHU_TASK_CORE);
+                        FEISHU_TASK_PRIO, &s_feishu_tok_task, FEISHU_TASK_CORE);
+    }
     if (tok_ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create Feishu token task");
         return ESP_FAIL;
     }
 
-    BaseType_t ws_ok = xTaskCreatePinnedToCore(feishu_ws_task, "feishu_ws",
+    BaseType_t ws_ok = pdPASS;
+    if (!s_feishu_ws_task) {
+        ws_ok = xTaskCreatePinnedToCore(feishu_ws_task, "feishu_ws",
                        FEISHU_TASK_STACK, NULL,
-                       FEISHU_TASK_PRIO, NULL, FEISHU_TASK_CORE);
+                       FEISHU_TASK_PRIO, &s_feishu_ws_task, FEISHU_TASK_CORE);
+    }
     if (ws_ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create Feishu tasks");
         return ESP_FAIL;
@@ -1150,6 +1204,7 @@ static esp_err_t ec_channel_feishu_send(const ec_msg_t *msg)
             cJSON *code = cJSON_GetObjectItem(root, "code");
             if (cJSON_IsNumber(code) && code->valueint == 0) {
                 ret = ESP_OK;
+                s_last_send_ok_at_us = esp_timer_get_time();
                 ESP_LOGI(TAG, "Feishu send ok to %s", receive_id);
             } else {
                 cJSON *msg = cJSON_GetObjectItem(root, "msg");

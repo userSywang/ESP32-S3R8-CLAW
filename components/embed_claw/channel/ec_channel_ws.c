@@ -167,6 +167,11 @@ static esp_err_t ws_handler(httpd_req_t *req)
 
 static esp_err_t ec_channel_ws_start(void)
 {
+    if (s_server) {
+        ESP_LOGI(TAG, "WebSocket server already running on port %d", EC_WS_PORT);
+        return ESP_OK;
+    }
+
     memset(s_clients, 0, sizeof(s_clients));
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
