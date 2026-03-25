@@ -1,6 +1,6 @@
 /**
  * @file wifi_connect.cpp
- * @author cangyu (sky.kirto@qq.com)
+ * @author sywang
  * @brief WiFi connection bridge (C interface over C++ wifi manager)
  * @version 0.1
  * @date 2026-03-02
@@ -18,10 +18,10 @@
 #include "wifi_manager.h"
 #include "ssid_manager.h"
 
-#include "embed_claw.h"
+#include "claw.h"
 #include "esp_system.h"
 
-#include "embedclaw_config.h"
+#include "claw_config.h"
 
 static const char *TAG = "wifi_connect";
 static bool s_embed_claw_started = false;
@@ -38,13 +38,13 @@ static void wifi_event_handler(WifiEvent event, const std::string &data)
         case WifiEvent::Connected:
             ESP_LOGI(TAG, "Connected successfully!");
             if (s_embed_claw_started) {
-                ESP_LOGI(TAG, "EmbedClaw services already running, skip duplicate start");
+                ESP_LOGI(TAG, "Claw services already running, skip duplicate start");
                 break;
             }
             {
                 esp_err_t err = ec_embed_claw_start();
                 if (err != ESP_OK) {
-                    ESP_LOGE(TAG, "EmbedClaw start failed after Wi-Fi connect: %s", esp_err_to_name(err));
+                    ESP_LOGE(TAG, "Claw start failed after Wi-Fi connect: %s", esp_err_to_name(err));
                     break;
                 }
                 s_embed_claw_started = true;

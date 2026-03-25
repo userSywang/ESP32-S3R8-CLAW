@@ -53,7 +53,7 @@ def _patch_asyncio_for_websockets_9() -> bool:
     except ValueError:
         return False
 
-    if major >= 10 or getattr(asyncio, "_embedclaw_loop_kw_patched", False):
+    if major >= 10 or getattr(asyncio, "_claw_loop_kw_patched", False):
         return False
 
     def wrap_callable(func):
@@ -68,7 +68,7 @@ def _patch_asyncio_for_websockets_9() -> bool:
     for name in ("Lock", "Event", "Condition", "Semaphore"):
         setattr(asyncio, name, wrap_callable(getattr(asyncio, name)))
 
-    asyncio._embedclaw_loop_kw_patched = True
+    asyncio._claw_loop_kw_patched = True
     return True
 
 def run_with_lark_oapi(app_id: str, app_secret: str, device_ws_url: str) -> None:

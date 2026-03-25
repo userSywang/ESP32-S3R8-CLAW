@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @author cangyu (sky.kirto@qq.com)
+ * @author sywang
  * @brief
  * @version 0.1
  * @date 2026-02-28
@@ -23,7 +23,7 @@
 
 #include "nvs_flash.h"
 
-#include "embedclaw_config.h"
+#include "claw_config.h"
 #include "wifi_connect.h"
 
 /* ==================== [Defines] =========================================== */
